@@ -2,6 +2,13 @@ import mongoose, { Document, Schema } from 'mongoose';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 
+export interface IWallet {
+  direct: number;   // Direct referral bonus wallet (cents)
+  level: number;    // Level income wallet (cents)
+  reward: number;   // Achievement rewards wallet (cents)
+  topup: number;    // Manual QR top-ups wallet (cents)
+}
+
 export interface IUser extends Document {
   name: string;
   phone: string;
@@ -13,7 +20,8 @@ export interface IUser extends Document {
   referralCode: string;
   referredBy?: mongoose.Types.ObjectId;
   role: 'user' | 'admin';
-  walletBalance: number; // stored in cents (integer), e.g. $10.00 = 1000
+  wallet: IWallet;
+  totalWallet: number;    // virtual: sum of all wallet buckets
   isActive: boolean;
   activePlan?: mongoose.Types.ObjectId;
   planActivatedAt?: Date;
@@ -21,13 +29,23 @@ export interface IUser extends Document {
   comparePassword(candidatePassword: string): Promise<boolean>;
 }
 
+const WalletSchema = new Schema<IWallet>(
+  {
+    direct: { type: Number, default: 0, min: 0 },  // Direct referral bonus
+    level:  { type: Number, default: 0, min: 0 },  // Level income
+    reward: { type: Number, default: 0, min: 0 },  // Achievement rewards
+    topup:  { type: Number, default: 0, min: 0 },  // Manual QR top-ups
+  },
+  { _id: false }  // embedded sub-document, no separate _id
+);
+
 const UserSchema = new Schema<IUser>(
   {
-    name: { type: String, required: true, trim: true },
-    phone: { type: String, required: true, unique: true, trim: true },
-    email: { type: String, trim: true, lowercase: true },
+    name:     { type: String, required: true, trim: true },
+    phone:    { type: String, required: true, unique: true, trim: true },
+    email:    { type: String, trim: true, lowercase: true },
     password: { type: String, required: true },
-    otp: { type: String },
+    otp:      { type: String },
     otpExpiry: { type: Date },
     isVerified: { type: Boolean, default: false },
     referralCode: {
@@ -37,13 +55,23 @@ const UserSchema = new Schema<IUser>(
     },
     referredBy: { type: Schema.Types.ObjectId, ref: 'User' },
     role: { type: String, enum: ['user', 'admin'], default: 'user' },
-    walletBalance: { type: Number, default: 0 }, // cents
+    wallet: { type: WalletSchema, default: () => ({ direct: 0, level: 0, reward: 0, topup: 0 }) },
     isActive: { type: Boolean, default: true },
     activePlan: { type: Schema.Types.ObjectId, ref: 'Plan', default: null },
     planActivatedAt: { type: Date },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+// Virtual: sum of all wallet buckets
+UserSchema.virtual('totalWallet').get(function (this: IUser) {
+  const w = this.wallet;
+  return (w?.direct ?? 0) + (w?.level ?? 0) + (w?.reward ?? 0) + (w?.topup ?? 0);
+});
 
 // Hash password before saving
 UserSchema.pre('save', async function (next) {

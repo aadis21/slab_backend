@@ -14,6 +14,7 @@ import referralRoutes from './routes/referral.routes';
 import planRequestRoutes from './routes/planRequest.routes';
 import withdrawalRoutes from './routes/withdrawal.routes';
 import donationRoutes from './routes/donation.routes';
+import walletRoutes from './routes/wallet.routes';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -64,6 +65,7 @@ app.use('/api/referral', referralRoutes);
 app.use('/api/plan-requests', planRequestRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/donations', donationRoutes);
+app.use('/api/wallet', walletRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (_req: Request, res: Response) => {

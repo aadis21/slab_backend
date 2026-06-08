@@ -1,9 +1,11 @@
 import { Response } from 'express';
 import { z } from 'zod';
 import { nanoid } from 'nanoid';
+import mongoose from 'mongoose';
 import WithdrawalRequest from '../models/WithdrawalRequest';
 import User from '../models/User';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { debitTotalWallet } from '../services/wallet.service';
 
 // ─── Create Withdrawal Request ────────────────────────────────────────────────
 export const createWithdrawalSchema = z.object({
@@ -22,8 +24,12 @@ export const createWithdrawal = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    if (amountCents > user.walletBalance) {
-      res.status(400).json({ success: false, error: 'Insufficient wallet balance' });
+    const totalBalance = user.totalWallet;
+    if (amountCents > totalBalance) {
+      res.status(400).json({
+        success: false,
+        error: `Insufficient total wallet balance. Available: $${(totalBalance / 100).toFixed(2)}`,
+      });
       return;
     }
 
@@ -61,7 +67,7 @@ export const adminGetAllWithdrawals = async (req: AuthRequest, res: Response): P
     if (status && typeof status === 'string') filter.status = status;
 
     const withdrawals = await WithdrawalRequest.find(filter)
-      .populate('user', 'name phone email walletBalance')
+      .populate('user', 'name phone email wallet')
       .populate('reviewedBy', 'name')
       .sort({ createdAt: -1 });
     res.json({ success: true, data: { withdrawals } });
@@ -98,14 +104,17 @@ export const approveWithdrawal = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    if (withdrawal.amountCents > user.walletBalance) {
-      res.status(400).json({ success: false, error: 'User has insufficient balance' });
+    if (withdrawal.amountCents > user.totalWallet) {
+      res.status(400).json({ success: false, error: 'User has insufficient total wallet balance' });
       return;
     }
 
-    // Deduct from wallet
-    user.walletBalance -= withdrawal.amountCents;
-    await user.save();
+    // Debit from wallets using the priority drain order (level → direct → reward → topup)
+    await debitTotalWallet(
+      withdrawal.user.toString(),
+      withdrawal.amountCents,
+      `Withdrawal payout request`
+    );
 
     // Generate unique payout wallet ID
     const payoutWalletId = 'WLT-' + nanoid(12).toUpperCase();
@@ -113,7 +122,7 @@ export const approveWithdrawal = async (req: AuthRequest, res: Response): Promis
     withdrawal.status = 'approved';
     withdrawal.payoutWalletId = payoutWalletId;
     withdrawal.reviewedAt = new Date();
-    withdrawal.reviewedBy = new (require('mongoose').Types.ObjectId)(adminId);
+    withdrawal.reviewedBy = new mongoose.Types.ObjectId(adminId);
     if (adminNote) withdrawal.adminNote = adminNote;
     await withdrawal.save();
 
@@ -150,7 +159,7 @@ export const rejectWithdrawal = async (req: AuthRequest, res: Response): Promise
 
     withdrawal.status = 'rejected';
     withdrawal.reviewedAt = new Date();
-    withdrawal.reviewedBy = new (require('mongoose').Types.ObjectId)(adminId);
+    withdrawal.reviewedBy = new mongoose.Types.ObjectId(adminId);
     if (adminNote) withdrawal.adminNote = adminNote;
     await withdrawal.save();
 

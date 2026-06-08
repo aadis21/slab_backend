@@ -59,7 +59,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
           email: user.email,
           role: user.role,
           referralCode: user.referralCode,
-          walletBalance: user.walletBalance,
+          wallet: user.wallet,
         },
       },
     });
@@ -110,7 +110,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           email: user.email,
           role: user.role,
           referralCode: user.referralCode,
-          walletBalance: user.walletBalance,
+          wallet: user.wallet,
         },
       },
     });
@@ -174,7 +174,7 @@ export const verifyOtpHandler = async (req: Request, res: Response): Promise<voi
           email: user.email,
           role: user.role,
           referralCode: user.referralCode,
-          walletBalance: user.walletBalance,
+          wallet: user.wallet,
         },
       },
     });

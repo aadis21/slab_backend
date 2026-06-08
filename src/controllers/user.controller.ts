@@ -6,7 +6,9 @@ import PlanRequest from '../models/PlanRequest';
 import Referral from '../models/Referral';
 import WithdrawalRequest from '../models/WithdrawalRequest';
 import Donation from '../models/Donation';
+import WalletLedger from '../models/WalletLedger';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { creditWallet } from '../services/wallet.service';
 
 // ─── Dashboard Stats ──────────────────────────────────────────────────────────
 export const getDashboardStats = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -22,20 +24,27 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    // Referral bonus earned
-    const referralAgg = await Referral.aggregate([
-      {
-        $match: {
-          referrer: new mongoose.Types.ObjectId(userId),
-          bonusAwarded: true,
-        },
-      },
-      { $group: { _id: null, totalBonus: { $sum: '$bonusAmount' } } },
-    ]);
-    const referralBonusCents = referralAgg[0]?.totalBonus || 0;
-
     // Referral count
     const referralCount = await Referral.countDocuments({ referrer: userId });
+
+    // Level income earned per level (grouped from ledger)
+    const levelIncomeByLevel = await WalletLedger.aggregate([
+      {
+        $match: {
+          userId: new mongoose.Types.ObjectId(userId),
+          walletType: 'level',
+          txType: 'credit',
+        },
+      },
+      {
+        $group: {
+          _id: '$level',
+          total: { $sum: '$amount' },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
 
     // Active plan request
     const activePlanRequest = await PlanRequest.findOne({ user: userId, status: 'pending' })
@@ -47,17 +56,20 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
       .sort({ createdAt: -1 })
       .limit(5);
 
+    const { direct = 0, level = 0, reward = 0, topup = 0 } = user.wallet;
+    const totalWallet = direct + level + reward + topup;
+
     res.json({
       success: true,
       data: {
         user,
         stats: {
-          walletBalance: user.walletBalance, // cents
+          wallet: { direct, level, reward, topup, total: totalWallet },
           activePlan: user.activePlan
             ? (user.activePlan as unknown as { name: string }).name
             : 'None',
           referralCount,
-          referralBonusCents,
+          levelIncomeByLevel,
         },
         activePlanRequest: activePlanRequest || null,
         recentRequests,
@@ -140,7 +152,7 @@ export const adminGetUserById = async (req: AuthRequest, res: Response): Promise
   }
 };
 
-// ─── Admin: Add Wallet Balance ────────────────────────────────────────────────
+// ─── Admin: Add Wallet Balance (credits topup bucket) ─────────────────────────
 export const adminAddWalletSchema = z.object({
   amountCents: z.number().int().positive('Amount must be a positive integer (cents)'),
   note: z.string().optional(),
@@ -148,23 +160,27 @@ export const adminAddWalletSchema = z.object({
 
 export const adminAddWallet = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { amountCents } = req.body as z.infer<typeof adminAddWalletSchema>;
+    const { amountCents, note } = req.body as z.infer<typeof adminAddWalletSchema>;
     const { id } = req.params;
 
-    const user = await User.findByIdAndUpdate(
-      id,
-      { $inc: { walletBalance: amountCents } },
-      { new: true }
-    ).select('-password -otp -otpExpiry');
+    const description = note ? `Admin manual credit: ${note}` : 'Admin manual credit';
+    await creditWallet(id, 'topup', amountCents, description);
 
-    if (!user) {
+    const updatedUser = await User.findById(id).select('wallet');
+    if (!updatedUser) {
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
 
+    const { direct = 0, level = 0, reward = 0, topup = 0 } = updatedUser.wallet;
+    const total = direct + level + reward + topup;
+
     res.json({
       success: true,
-      data: { message: `Added $${(amountCents / 100).toFixed(2)} to wallet`, walletBalance: user.walletBalance },
+      data: {
+        message: `Added $${(amountCents / 100).toFixed(2)} to topup wallet`,
+        wallet: { direct, level, reward, topup, total },
+      },
     });
   } catch (err) {
     console.error('Admin add wallet error:', err);
@@ -184,7 +200,10 @@ export const adminToggleUserStatus = async (req: AuthRequest, res: Response): Pr
     user.isActive = !user.isActive;
     await user.save();
 
-    res.json({ success: true, data: { message: `User ${user.isActive ? 'activated' : 'deactivated'}`, isActive: user.isActive } });
+    res.json({
+      success: true,
+      data: { message: `User ${user.isActive ? 'activated' : 'deactivated'}`, isActive: user.isActive },
+    });
   } catch (err) {
     console.error('Toggle user status error:', err);
     res.status(500).json({ success: false, error: 'Server error' });
@@ -207,10 +226,22 @@ export const adminGetStats = async (_req: AuthRequest, res: Response): Promise<v
       (await import('../models/Plan')).default.countDocuments({ isActive: true }),
       PlanRequest.countDocuments({ status: 'pending' }),
       WithdrawalRequest.countDocuments({ status: 'pending' }),
-      User.aggregate([{ $group: { _id: null, total: { $sum: '$walletBalance' } } }]),
+      User.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalDirect: { $sum: '$wallet.direct' },
+            totalLevel: { $sum: '$wallet.level' },
+            totalReward: { $sum: '$wallet.reward' },
+            totalTopup: { $sum: '$wallet.topup' },
+          },
+        },
+      ]),
     ]);
 
-    const totalWalletBalanceCents = walletAgg[0]?.total || 0;
+    const agg = walletAgg[0] ?? { totalDirect: 0, totalLevel: 0, totalReward: 0, totalTopup: 0 };
+    const totalWalletBalanceCents =
+      agg.totalDirect + agg.totalLevel + agg.totalReward + agg.totalTopup;
 
     const recentPlanRequests = await PlanRequest.find()
       .populate('user', 'name phone')
@@ -249,7 +280,10 @@ export const adminCreateUserSchema = z.object({
   email: z.string().email('Invalid email address').optional().or(z.literal('')),
   password: z.string().min(6, 'Password must be at least 6 characters'),
   role: z.enum(['user', 'admin']).default('user'),
-  walletBalance: z.number().int().min(0).default(0), // in cents
+  walletDirect: z.number().int().min(0).default(0),
+  walletLevel: z.number().int().min(0).default(0),
+  walletReward: z.number().int().min(0).default(0),
+  walletTopup: z.number().int().min(0).default(0),
   isActive: z.boolean().default(true),
 });
 
@@ -258,14 +292,12 @@ export const adminCreateUser = async (req: AuthRequest, res: Response): Promise<
     const data = req.body as z.infer<typeof adminCreateUserSchema>;
     const emailVal = data.email && data.email !== '' ? data.email.trim().toLowerCase() : undefined;
 
-    // Check if phone already registered
     const existingPhone = await User.findOne({ phone: data.phone.trim() });
     if (existingPhone) {
       res.status(409).json({ success: false, error: 'Phone number already registered' });
       return;
     }
 
-    // Check if email already registered (if provided)
     if (emailVal) {
       const existingEmail = await User.findOne({ email: emailVal });
       if (existingEmail) {
@@ -278,17 +310,22 @@ export const adminCreateUser = async (req: AuthRequest, res: Response): Promise<
       name: data.name.trim(),
       phone: data.phone.trim(),
       email: emailVal,
-      password: data.password, // hashed automatically by UserSchema's pre-save middleware
+      password: data.password,
       role: data.role,
-      walletBalance: data.walletBalance,
+      wallet: {
+        direct: data.walletDirect,
+        level: data.walletLevel,
+        reward: data.walletReward,
+        topup: data.walletTopup,
+      },
       isActive: data.isActive,
-      isVerified: true, // Admin-created users are pre-verified
+      isVerified: true,
     });
 
-    const userResponse = newUser.toObject();
-    delete (userResponse as any).password;
-    delete (userResponse as any).otp;
-    delete (userResponse as any).otpExpiry;
+    const userResponse = newUser.toObject() as unknown as Record<string, unknown>;
+    delete userResponse.password;
+    delete userResponse.otp;
+    delete userResponse.otpExpiry;
 
     res.status(201).json({ success: true, data: { user: userResponse } });
   } catch (err) {
@@ -303,7 +340,10 @@ export const adminUpdateUserSchema = z.object({
   phone: z.string().min(10).optional(),
   email: z.string().email().optional().or(z.literal('')),
   role: z.enum(['user', 'admin']).optional(),
-  walletBalance: z.number().int().min(0).optional(), // in cents
+  walletDirect: z.number().int().min(0).optional(),
+  walletLevel: z.number().int().min(0).optional(),
+  walletReward: z.number().int().min(0).optional(),
+  walletTopup: z.number().int().min(0).optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -318,7 +358,6 @@ export const adminUpdateUser = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Check phone uniqueness if updated
     if (data.phone && data.phone !== user.phone) {
       const existingPhone = await User.findOne({ phone: data.phone.trim() });
       if (existingPhone) {
@@ -328,7 +367,6 @@ export const adminUpdateUser = async (req: AuthRequest, res: Response): Promise<
       user.phone = data.phone.trim();
     }
 
-    // Check email uniqueness if updated
     if (data.email !== undefined) {
       const emailVal = data.email && data.email !== '' ? data.email.trim().toLowerCase() : undefined;
       if (emailVal && emailVal !== user.email) {
@@ -343,15 +381,18 @@ export const adminUpdateUser = async (req: AuthRequest, res: Response): Promise<
 
     if (data.name) user.name = data.name.trim();
     if (data.role) user.role = data.role;
-    if (data.walletBalance !== undefined) user.walletBalance = data.walletBalance;
+    if (data.walletDirect !== undefined) user.wallet.direct = data.walletDirect;
+    if (data.walletLevel !== undefined) user.wallet.level = data.walletLevel;
+    if (data.walletReward !== undefined) user.wallet.reward = data.walletReward;
+    if (data.walletTopup !== undefined) user.wallet.topup = data.walletTopup;
     if (data.isActive !== undefined) user.isActive = data.isActive;
 
     await user.save();
 
-    const userResponse = user.toObject();
-    delete (userResponse as any).password;
-    delete (userResponse as any).otp;
-    delete (userResponse as any).otpExpiry;
+    const userResponse = user.toObject() as unknown as Record<string, unknown>;
+    delete userResponse.password;
+    delete userResponse.otp;
+    delete userResponse.otpExpiry;
 
     res.json({ success: true, data: { user: userResponse } });
   } catch (err) {
@@ -371,12 +412,12 @@ export const adminDeleteUser = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Clean up referrals and other user data as needed (optional but good practice)
     await Promise.all([
       PlanRequest.deleteMany({ user: id }),
       WithdrawalRequest.deleteMany({ user: id }),
       Referral.deleteMany({ $or: [{ referrer: id }, { referee: id }] }),
       Donation.deleteMany({ user: id }),
+      WalletLedger.deleteMany({ userId: id }),
     ]);
 
     res.json({ success: true, data: { message: 'User and all related records deleted successfully' } });
@@ -385,4 +426,3 @@ export const adminDeleteUser = async (req: AuthRequest, res: Response): Promise<
     res.status(500).json({ success: false, error: 'Server error deleting user' });
   }
 };
-

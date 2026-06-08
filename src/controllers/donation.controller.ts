@@ -1,9 +1,8 @@
 import { Response } from 'express';
 import { z } from 'zod';
-import mongoose from 'mongoose';
 import Donation from '../models/Donation';
-import User from '../models/User';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { creditWallet } from '../services/wallet.service';
 
 // ─── Create Donation Schema ──────────────────────────────────────────────────
 export const createDonationSchema = z.object({
@@ -63,7 +62,7 @@ export const getMyDonations = async (req: AuthRequest, res: Response): Promise<v
 export const adminGetAllDonations = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { status } = req.query;
-    const filter: Record<string, any> = {};
+    const filter: Record<string, unknown> = {};
     if (status && typeof status === 'string') {
       filter.status = status;
     }
@@ -81,48 +80,48 @@ export const adminGetAllDonations = async (req: AuthRequest, res: Response): Pro
 
 // ─── Admin: Approve Donation ───────────────────────────────────────────────────
 export const approveDonation = async (req: AuthRequest, res: Response): Promise<void> => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
   try {
     const { id } = req.params;
 
-    const donation = await Donation.findById(id).session(session);
+    const donation = await Donation.findById(id);
     if (!donation) {
-      await session.abortTransaction();
       res.status(404).json({ success: false, error: 'Donation record not found' });
       return;
     }
 
     if (donation.status !== 'pending') {
-      await session.abortTransaction();
       res.status(400).json({ success: false, error: 'Donation has already been processed' });
       return;
     }
 
-    // Approve the donation
+    // Mark donation as approved first
     donation.status = 'approved';
-    await donation.save({ session });
+    await donation.save();
 
-    // Since this is a donation, let's credit the user's wallet if specified
-    // Note: The user request mentions: "payemnt hum apni saccner lageyeg euqr code kii image aur jitni payment kr ahai vo jo user krha ahi uskii utni amount aa jaaye"
-    // Meaning the amount they donate or top up via scanner should credit their user wallet balance when approved!
-    await User.findByIdAndUpdate(
-      donation.user,
-      { $inc: { walletBalance: donation.amountCents } },
-      { session }
-    );
+    // Credit the user's topup wallet atomically via wallet service
+    try {
+      await creditWallet(
+        donation.user.toString(),
+        'topup',
+        donation.amountCents,
+        `Manual QR top-up approved (TxID: ${donation.transactionId})`
+      );
+    } catch (walletErr) {
+      console.error('Failed to credit topup wallet after donation approval:', walletErr);
+      // Revert donation status if wallet credit fails
+      donation.status = 'pending';
+      await donation.save();
+      res.status(500).json({ success: false, error: 'Failed to credit wallet. Please retry.' });
+      return;
+    }
 
-    await session.commitTransaction();
     res.json({
       success: true,
-      data: { message: 'Donation approved. Wallet balance updated.', donation },
+      data: { message: 'Donation approved. Topup wallet balance updated.', donation },
     });
   } catch (err) {
-    await session.abortTransaction();
     console.error('Approve donation error:', err);
     res.status(500).json({ success: false, error: 'Server error approving donation' });
-  } finally {
-    session.endSession();
   }
 };
 

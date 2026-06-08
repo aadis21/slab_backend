@@ -6,6 +6,8 @@ import User from '../models/User';
 import Plan from '../models/Plan';
 import Referral from '../models/Referral';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { creditWallet } from '../services/wallet.service';
+import { distributeLevelIncome } from '../services/levelIncome.service';
 
 // ─── Request a Plan ───────────────────────────────────────────────────────────
 export const requestPlanSchema = z.object({
@@ -78,7 +80,7 @@ export const approvePlanRequest = async (req: AuthRequest, res: Response): Promi
     const { id } = req.params;
     const adminId = req.user?.userId;
 
-    const planReq = await PlanRequest.findById(id).session(session);
+    const planReq = await PlanRequest.findById(id).populate('plan').session(session);
     if (!planReq) {
       await session.abortTransaction();
       res.status(404).json({ success: false, error: 'Plan request not found' });
@@ -90,7 +92,7 @@ export const approvePlanRequest = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    // Update the plan request
+    // Update the plan request status
     planReq.status = 'approved';
     planReq.reviewedAt = new Date();
     planReq.reviewedBy = new mongoose.Types.ObjectId(adminId);
@@ -103,20 +105,52 @@ export const approvePlanRequest = async (req: AuthRequest, res: Response): Promi
       { session }
     );
 
-    // Award referral bonus to referrer if applicable
-    const referral = await Referral.findOne({ referee: planReq.user, bonusAwarded: false }).session(session);
+    // Award direct referral bonus to referrer if not yet awarded
+    const referral = await Referral.findOne({
+      referee: planReq.user,
+      bonusAwarded: false,
+    }).session(session);
+
+    let referrerId: string | null = null;
+    let bonusAmount = 0;
+
     if (referral) {
+      referrerId = referral.referrer.toString();
+      bonusAmount = referral.bonusAmount;
+
       referral.bonusAwarded = true;
       await referral.save({ session });
-      // Credit the referrer's wallet
-      await User.findByIdAndUpdate(
-        referral.referrer,
-        { $inc: { walletBalance: referral.bonusAmount } },
-        { session }
+    }
+
+    // Commit the main transaction first
+    await session.commitTransaction();
+
+    // ─── Post-commit: Fire non-blocking side effects ──────────────────────────
+    // 1. Credit direct referral bonus to referrer's 'direct' wallet
+    if (referrerId && bonusAmount > 0) {
+      creditWallet(
+        referrerId,
+        'direct',
+        bonusAmount,
+        `Direct referral bonus from plan approval`,
+        planReq.user.toString(),
+        planReq.plan.toString()
+      ).catch((err: unknown) =>
+        console.error('Failed to credit direct referral bonus:', err)
       );
     }
 
-    await session.commitTransaction();
+    // 2. Distribute level income up to 9 levels (fire-and-forget)
+    const planDoc = planReq.plan as unknown as { _id: mongoose.Types.ObjectId; priceUSD: number };
+    const planAmount = planDoc?.priceUSD ?? 0;
+    const planId = planDoc?._id?.toString() ?? '';
+
+    if (planAmount > 0 && planId) {
+      distributeLevelIncome(planReq.user.toString(), planAmount, planId).catch((err: unknown) =>
+        console.error('Level income distribution error:', err)
+      );
+    }
+
     res.json({ success: true, data: { message: 'Plan request approved. Subscription activated.' } });
   } catch (err) {
     await session.abortTransaction();
